@@ -1,0 +1,145 @@
+# ============================================================
+# 本番自動デプロイ（マージ＝公開・承認なし運用・2026-09-29 本人決定）
+#   ※ reflameinc/midcareer-teacher の deploy.yml を元に、転送先をこのLP用に変えたもの（2026-10-20）
+#     差分: 転送先を /lp/midcareer/engineer/ に固定・初回は転送先フォルダを rsync が作る（newgrads-aff-gyakuten と同じ方式）
+#
+#   プルリク作成・更新 → 検品(check.sh) のみ。鍵は使わない・本番は変わらない
+#   main へのマージ     → 検品 → 本番へ転送 → 本番URLと実測照合
+#   戻すとき           → マージ済みプルリクの「Revert」→ そのプルリクをマージ
+#
+#   承認を挟みたくなったら（設定だけで切替・このファイルは変えない）:
+#     マージ前に誰かが見る   = Ruleset の Required approvals を 1 に
+#     本番反映前に誰かが押す = production 環境の Required reviewers に承認者を追加
+#
+# 安全装置:
+#   - SSH鍵は production 環境の Secret にだけ置く（環境の設定で main 限定）
+#     → ブランチやプルリクからは鍵を使えない（この鍵は reflame.co.jp 全体に入れるため）
+#   - .github/ と scripts/ の変更は CODEOWNERS で中山さんのレビュー必須
+#   - 転送先は下の DEPLOY_PATH に固定。この値と完全に一致しなければ止まる
+#   - 転送するのは scripts/deploy-files.sh が出す一覧だけ（許可リスト方式・2026-09-29）
+#     = index.html ＋ assets/ の画像/css/js/フォント/動画。php・.htaccess・svg・html・シンボリックリンクは検品で止める
+#     （assets/ は Code Owners の対象外なので、ここで止めないと担当者1人でサーバー全体に届く）
+#   - 削除同期(--delete)はしない。サーバー側で不要になったファイルは手動で片付ける
+#   - リポジトリ変数 DEPLOY_ENABLED が 'true' でない間は、マージしても dry-run 止まり
+# ============================================================
+name: deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: www1151.onamae.ne.jp
+  DEPLOY_PORT: "8022"
+  DEPLOY_USER: r1300591
+  DEPLOY_PATH: /home/r1300591/public_html/reflame.co.jp/lp/midcareer/engineer/
+  LIVE_URL: https://reflame.co.jp/lp/midcareer/engineer/
+  # -l を付けない＋--no-links＝シンボリックリンクは送らない。--files-from の一覧以外は送らない
+  RSYNC_OPTS: -rtzc --no-links --chmod=D755,F644 --itemize-changes
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: 検品（preflight 相当）
+        run: bash scripts/check.sh .
+      - name: 転送の予行（ローカル・鍵なし）
+        # 本番と同じ一覧・同じ rsync オプションで手元の一時フォルダへ写し、一覧外が1つも出ないことを確かめる
+        run: |
+          bash scripts/deploy-files.sh . > "$RUNNER_TEMP/files.txt"
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          rsync $RSYNC_OPTS --files-from="$RUNNER_TEMP/files.txt" ./ "$out/" > /dev/null
+          (cd "$out" && find . -type f -o -type l | sed 's|^\./||' | sort) > "$RUNNER_TEMP/copied.txt"
+          sort "$RUNNER_TEMP/files.txt" > "$RUNNER_TEMP/want.txt"
+          if diff -u "$RUNNER_TEMP/want.txt" "$RUNNER_TEMP/copied.txt"; then
+            echo "✓ 転送予定 $(wc -l < "$RUNNER_TEMP/want.txt") 件・一覧外の転送なし"
+          else
+            echo "🛑 一覧と実際に写ったファイルが一致しない"; exit 1
+          fi
+
+  deploy:
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://reflame.co.jp/lp/midcareer/engineer/
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 実行モードの決定
+        id: mode
+        run: |
+          if [ "${{ vars.DEPLOY_ENABLED }}" = "true" ]; then
+            echo "dry=" >> "$GITHUB_OUTPUT"; echo "▶ 本番転送モード"
+          else
+            echo "dry=--dry-run" >> "$GITHUB_OUTPUT"; echo "▶ 予行演習モード（DEPLOY_ENABLED≠true・本番は変わらない）"
+          fi
+
+      - name: 転送先の検査
+        run: |
+          case "$DEPLOY_PATH" in
+            /home/r1300591/public_html/reflame.co.jp/lp/midcareer/engineer/) echo "✓ 転送先: $DEPLOY_PATH" ;;
+            *) echo "🛑 転送先が想定外の形: $DEPLOY_PATH"; exit 1 ;;
+          esac
+
+      - name: SSH の準備
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          [ -n "$SSH_KEY" ] || { echo "🛑 Secret DEPLOY_SSH_KEY が未登録（production 環境の Secrets を確認）"; exit 1; }
+          [ -n "$KNOWN_HOSTS" ] || { echo "🛑 Secret DEPLOY_KNOWN_HOSTS が未登録（production 環境の Secrets を確認）"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # 接続失敗(255)とフォルダ不在(1)を分けて表示する
+          # 親フォルダ（/lp/midcareer/）の実在を確かめる。engineer/ は初回の転送で rsync が作る
+          #（転送先は上の検査で完全一致に固定済みなので、名前の誤りはそこで止まる）
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" -o BatchMode=yes -o ConnectTimeout=20 "$DEPLOY_USER@$DEPLOY_HOST" \
+            "test -d '${DEPLOY_PATH%engineer/}'"; rc=$?
+          if [ $rc -eq 255 ]; then
+            echo "🛑 SSH接続に失敗（'Connection closed' ならお名前.com の国外アクセス制限、'Permission denied' なら鍵の不一致）"; exit 1
+          elif [ $rc -ne 0 ]; then
+            echo "🛑 サーバーに親フォルダ（/lp/midcareer/）が無い"; exit 1
+          fi
+          echo "✓ SSH接続・親フォルダの実在を確認"
+
+      - name: 転送リストの作成
+        run: |
+          bash scripts/deploy-files.sh . > "$RUNNER_TEMP/files.txt"
+          echo "転送予定 $(wc -l < "$RUNNER_TEMP/files.txt") 件:"; cat "$RUNNER_TEMP/files.txt"
+
+      - name: 転送（rsync）
+        run: |
+          rsync $RSYNC_OPTS ${{ steps.mode.outputs.dry }} \
+            --files-from="$RUNNER_TEMP/files.txt" \
+            -e "ssh -i $HOME/.ssh/deploy_key -p $DEPLOY_PORT -o BatchMode=yes" \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH"
+
+      - name: 本番URLと実測照合
+        if: steps.mode.outputs.dry == ''
+        run: |
+          want=$(sha256sum index.html | cut -d' ' -f1)
+          for i in 1 2 3; do
+            got=$(curl -fsS -H 'Cache-Control: no-cache' "${LIVE_URL}?v=${GITHUB_SHA}" | sha256sum | cut -d' ' -f1)
+            [ "$got" = "$want" ] && { echo "✓ 本番の index.html がリポジトリと一致"; break; }
+            echo "…不一致（$i/3）。10秒後に再確認"; sleep 10
+          done
+          [ "$got" = "$want" ] || { echo "🛑 本番の index.html がリポジトリと一致しない"; exit 1; }
+          fail=0
+          # パイプ(|)で while に渡すと fail が外に伝わらないので、プロセス置換で読む
+          while IFS= read -r f; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${LIVE_URL}${f}")
+            [ "$code" = "200" ] || { echo "🛑 $f → HTTP $code"; fail=1; }
+          done < <(grep '^assets/' "$RUNNER_TEMP/files.txt")
+          [ $fail -eq 0 ] && echo "✓ assets 全て HTTP 200" || exit 1
