@@ -1,5 +1,5 @@
 'use strict';
-// Booking happens in the embedded form (#reflame-booking); the CTAs only scroll there.
+// Booking happens in the step form (assets/stepform.js inside #reflame-booking); the CTAs only scroll there.
 // The form reads utm/fbclid from this page's URL and sends the booking event itself,
 // so never push a booking event here (it would be counted twice).
 
@@ -20,21 +20,3 @@ if ('IntersectionObserver' in window) {
   bookingVisibility.observe(finalBookingSection);
 } else { stickyAction.hidden = false; }
 
-// The embedded booking form renders in a shadow root, so lift its 11-13px labels to 14px on phones here.
-(function liftBookingFontSize(){
-  const css = '@media (max-width:760px){label,.step,.fe,.wk-lbl,.wk-hint,.wk-head .wk-dow,.date,.who-bio,.who-back{font-size:14px!important}}';
-  let tries = 0;
-  (function wait(){
-    const root = document.getElementById('reflame-booking-widget')?.shadowRoot;
-    if (!root) { if (++tries < 120) setTimeout(wait, 250); return; }
-    const paint = () => {
-      if (root.getElementById('rf-font-14')) return;
-      const style = document.createElement('style');
-      style.id = 'rf-font-14';
-      style.textContent = css;
-      root.appendChild(style);
-    };
-    paint();
-    new MutationObserver(paint).observe(root, {childList:true});
-  })();
-})();
